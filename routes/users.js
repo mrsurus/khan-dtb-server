@@ -1,67 +1,63 @@
 const express = require('express');
 const { ObjectId } = require('mongodb');
 const upload = require('../middleware/upload');
-const { bucket } = require('../config/firebaseConfig');
+// const { bucket } = require('../config/firebaseConfig');
+const {getB2Authorization,getUploadUrl, B2_BUCKET_NAME} = require('../config/b2Authorization');
 const router = express.Router();
 const { usersCollection } = require('../config/db');
-const path = require('path')
+const path = require('path');
+const { default: axios } = require('axios');
 
 router.post('/:email/uploadfile', upload.single('file'), async (req, res) => {
     try {
-        const { email } = req.params; // Get agent ID from URL params
-        const { fileType } = req.body; // Get file type from request body
-
-        if (!req.file || !fileType) {
-            return res.status(400).send("File and file type are required.");
-        }
-
-        // File upload to Firebase Storage
-        const fileName = Date.now() + path.extname(req.file.originalname); // Unique file name
-        const fileUpload = bucket.file(fileName);
-
-        const blobStream = fileUpload.createWriteStream({
-            metadata: {
-                contentType: req.file.mimetype,
-            },
-        });
-
-        blobStream.on("error", (err) => {
-            console.log(err);
-            res.status(500).send({ message: "Something went wrong while uploading the file" });
-        });
-
-        blobStream.on("finish", async () => {
-            await fileUpload.makePublic();
-
-            // Firebase file URL
-            const fileUrl = `https://storage.googleapis.com/${bucket.name}/${fileUpload.name}`;
-
-            // Prepare the file object
-            const fileObject = {
-                name: req.file.originalname,
-                url: fileUrl
-            };
-
-            // Update the specific agent's document by ID, adding the file to the appropriate type array
-            const updateField = { [`${fileType}`]: fileObject };
-
-            await usersCollection.updateOne(
-                { email: email },
-                { $push: updateField }
-            );
-
-            res.status(200).send({
-                message: "File uploaded successfully",
-                fileUrl: fileUrl,
-            });
-        });
-
-        blobStream.end(req.file.buffer); // Upload the file buffer
+      const { email } = req.params;
+      const { fileType } = req.body;
+  
+      if (!req.file || !fileType) {
+        return res.status(400).send("File and file type are required.");
+      }
+  
+      // Get the upload URL and token from Backblaze B2
+      const { uploadUrl, uploadAuthToken } = await getUploadUrl();
+  
+      // Generate a unique file name
+      const fileName = Date.now() + path.extname(req.file.originalname);
+  
+      // Upload the file to Backblaze B2
+      const uploadResponse = await axios.post(uploadUrl, req.file.buffer, {
+        headers: {
+          Authorization: uploadAuthToken,
+          'X-Bz-File-Name': fileName,
+          'Content-Type': req.file.mimetype,
+          'X-Bz-Content-Sha1': 'do_not_verify',
+        },
+      });
+  
+      // Construct the file URL
+      const fileUrl = `https://f005.backblazeb2.com/file/${B2_BUCKET_NAME}/${fileName}`;
+      const fileId = uploadResponse.data.fileId
+      // Save file information to the database
+      const fileObject = {
+        name: req.file.originalname,
+        url: fileUrl,
+        fileId: fileId
+      };
+  
+      const updateField = { [`${fileType}`]: fileObject };
+      await usersCollection.updateOne(
+        { email: email },
+        { $push: updateField }
+      );
+  
+      res.status(200).send({
+        message: "File uploaded successfully",
+        fileUrl,
+      });
     } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Error uploading file", error });
+      console.error('Error uploading file:', error.message);
+      res.status(500).send({ message: "Error uploading file", error: error.message });
     }
-});
+  });
 
 router.get('/', async (req, res) => {
     const { page, limit, email } = req.query;
@@ -154,48 +150,70 @@ router.delete('/:id', async (req, res) => {
 
 router.delete('/:userId/deletefile', async (req, res) => {
     try {
-      const { userId } = req.params; // User ID from URL params
-      const { fileUrl } = req.body; // File URL from request body
-        
-      if (!fileUrl) {
-        return res.status(400).send({ message: "File URL is required." });
+      const { userId } = req.params; // Agent ID from URL params
+      const { fileUrl, fileId } = req.body; // File URL and File ID from request body
+      console.log(fileUrl, fileId)
+  
+      if (!fileUrl || !fileId) {
+        return res.status(400).send({ message: "File URL and file ID are required." });
       }
   
       // Extract file name from the URL
       const fileName = fileUrl.split('/').pop();
-      console.log(fileName)
-      const file = bucket.file(fileName);
-  
-      // Attempt to delete the file from Firebase Storage
-      try {
-        await file.delete();
-        console.log("File deleted from Firebase Storage.");
-      } catch (error) {
-        if (error.code === 404) {
-          console.warn("File does not exist in Firebase Storage, skipping deletion.");
-        } else {
-          throw error;
-        }
+      if (!fileName) {
+        return res.status(400).send({ message: "Invalid file URL." });
       }
-
+  
+      console.log("File name:", fileName);
+  
+      // Step 1: Authenticate with Backblaze
+      const { authToken, apiUrl } = await getB2Authorization(); // Ensure this function provides `authToken` and `apiUrl`
+  
+      // Step 2: Delete file from Backblaze
+      try {
+        const deleteResponse = await axios.post(
+          `${apiUrl}/b2api/v2/b2_delete_file_version`,
+          {
+            fileName: fileName,
+            fileId: fileId, // Ensure you store and pass the correct file ID
+          },
+          {
+            headers: {
+              Authorization: authToken, // Auth token received from Backblaze
+            },
+          }
+        );
+        console.log("File deleted from Backblaze:", deleteResponse.data);
+      } catch (error) {
+        console.error(
+          "Error deleting file from Backblaze:",
+          error.response ? error.response.data : error.message
+        );
+        return res.status(500).send({ message: "Error deleting file from storage.", error });
+      }
+  
+      // Step 3: Remove file reference from MongoDB
       const updateQuery = {
         $pull: {
-          "image": { url: fileUrl },
-          "video": { url: fileUrl },
-          "audio": { url: fileUrl },
-          "pdf": { url: fileUrl }
-        }
+          image: { url: fileUrl },
+          video: { url: fileUrl },
+          audio: { url: fileUrl },
+          pdf: { url: fileUrl },
+        },
       };
   
-      // Remove the file object from the user's document in MongoDB
-      await usersCollection.updateOne(
+      const result = await usersCollection.updateOne(
         { _id: new ObjectId(userId) },
-        updateQuery 
+        updateQuery
       );
+  
+      if (result.modifiedCount === 0) {
+        return res.status(404).send({ message: "File link not found in any type array." });
+      }
   
       res.status(200).send({ message: "File deleted successfully." });
     } catch (error) {
-      console.error("Error deleting file:", error);
+      console.error("Error deleting file:", error.message);
       res.status(500).send({ message: "Error deleting file", error });
     }
   });

@@ -1,15 +1,9 @@
 const express = require('express');
-const downloadFile = require('../utils/downloadFile');
+const {downloadFile} = require('../utils/downloadFile');
 const router = express.Router();
 const { usersCollection } = require('../config/db');
 
-router.get('/download', async (req, res) => {
-  const { fileUrl } = req.query;
-  if (!fileUrl) {
-    return res.status(400).send("File URL is required");
-  }
-  await downloadFile(fileUrl, res);
-});
+router.get('/download', downloadFile);
 
 router.post('/check-email', async (req, res) => {
     const { email } = req.body;
